@@ -1,0 +1,14 @@
+[package]
+
+name = "redis_orm"
+version = "0.0.1"
+authors = [ "Andreas Stocker <shadowstep7@gmail.com>" ]
+
+[[bin]]
+
+name = "redis_orm"
+
+[dependencies]
+redis = "0.5.2"
+rustc-serialize = "0.3"
+bincode = "0.4.0"
