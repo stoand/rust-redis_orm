@@ -1,0 +1,6 @@
+max_width = 140
+ideal_width = 140
+struct_lit_width = 140
+fn_call_width = 10000
+reorder_imports = true
+format_strings = false
