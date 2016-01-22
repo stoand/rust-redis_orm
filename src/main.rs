@@ -4,70 +4,76 @@ extern crate bincode;
 extern crate uuid;
 
 use rustc_serialize::{Decodable, Encodable};
-use std::convert::Into;
-use redis::{Commands, Pipeline, PipelineCommands};
+use bincode::rustc_serialize::EncodingResult;
+use std::f64;
+use redis::{Commands, ConnectionLike, Pipeline, PipelineCommands};
 use uuid::Uuid;
+use std::error::Error;
 
-trait Database {
-    fn store<T>(&self, record: &T) -> Result<Uuid, String> where T: Indexable;
-
-    /// Create an index for a field in the database
-    fn index_field<T>(&self, name: &'static str, value: &T) where T: Encodable;
-
-    /// Numeric fields are indexed differently
-    fn index_num_field<T>(&self, name: &'static str, value: &T) where T: Encodable + Into<f64>;
-}
-
-impl Database for redis::Connection {
+trait Indexable where Self: Encodable + Decodable + PartialEq {
     /// Writes indexable record to database and returns it's Uuid
-    fn store<T>(&self, record: &T) -> Result<Uuid, String>
-        where T: Indexable
-    {
-        // Make error.description() function available
-        use std::error::Error;
+
+    fn store(&self, db: &redis::Connection) -> Result<Uuid, String> {
 
         // Serialize the record into binary
-        let encoded_record = try!(bincode::rustc_serialize::encode(record, bincode::SizeLimit::Infinite)
+        let encoded_record = try!(bincode::rustc_serialize::encode(self, bincode::SizeLimit::Infinite)
                                       .map_err(|encode_err| encode_err.description().to_string()));
-
         // Generate an id for the record
         let record_id = Uuid::new_v4();
 
-        // Create the record
-        try!(Pipeline::new()
-                 .atomic()
-                 .hset(T::get_storage_name(), record_id.as_bytes(), encoded_record)
-                 .query(self)
-                 .map_err(|redis_err: redis::RedisError| redis_err.description().to_string()));
+        // Create redis pipeline which represents a transaction
+        let mut pipeline = Pipeline::new();
+        pipeline.atomic();
 
-        // Create record indices TODO
-        record.index(self);
+        // Save the record to the database
+        pipeline.hset(Self::get_storage_name(), record_id.as_bytes(), encoded_record);
+
+        let indices = try!(self.get_indices().map_err(|encode_err| encode_err.description().to_string()));
+
+        for index in indices {
+            // Unique identifier for this field
+            let mut index_key = match index {
+                Index::Raw{name, ..} | Index::Numeric  {name, ..} => {
+                    (Self::get_storage_name().to_string() + "\n" + name + "\n").into_bytes()
+                }
+            };
+
+            match index {
+                Index::Raw{value, ..} => {
+                    // Append the value to the unique field name
+                    index_key.append(&mut value.clone());
+                    // Add the record id to a set which keeps track of records
+                    // of a certain type with a certain value
+                    pipeline.sadd(index_key, record_id.as_bytes());
+                }
+                Index::Numeric {value, ..} => {
+                    pipeline.zadd(index_key, record_id.as_bytes(), value);
+                }
+            };
+        }
+
+        // Run pipeline queries
+        try!(pipeline.query(db).map_err(|redis_err| redis_err.description().to_string()));
 
         Ok(record_id)
     }
-
-    /// Create an index for a field in the database
-    fn index_field<T>(&self, name: &'static str, value: &T)
-        where T: Encodable
-    {
-        // TODO
-    }
-
-    /// Numeric fields are indexed differently
-    fn index_num_field<T>(&self, name: &'static str, value: &T)
-        where T: Encodable + Into<f64>
-    {
-        // TODO
-    }
-}
-
-trait Indexable where Self: Encodable + Decodable + PartialEq {
     /// Creates indices for the record in the database that
     /// can later be used to search for it
-    fn index<D>(&self, db: &D) where D: Database;
+    fn get_indices(&self) -> EncodingResult<Vec<Index>>;
 
     /// Name of struct in database
     fn get_storage_name() -> &'static str;
+}
+
+enum Index {
+    Raw {
+        name: &'static str,
+        value: Vec<u8>,
+    },
+    Numeric {
+        name: &'static str,
+        value: f64,
+    },
 }
 
 #[derive(RustcEncodable, RustcDecodable, PartialEq)]
@@ -77,11 +83,8 @@ struct User {
 }
 
 impl Indexable for User {
-    fn index<D>(&self, db: &D)
-        where D: Database
-    {
-        db.index_field("name", &self.name);
-        db.index_num_field("age", &self.age);
+    fn get_indices(&self) -> EncodingResult<Vec<Index>> {
+        Ok(vec![Index::Raw { name: "name", value: self.name.as_bytes().to_vec() }, Index::Numeric { name: "age", value: self.age as f64 }])
     }
 
     fn get_storage_name() -> &'static str {
@@ -96,7 +99,7 @@ fn main() {
 
         let user = User { name: "Andy".to_string(), age: 32 };
 
-        println!("user id: {}", db.store(&user).unwrap());
+        println!("user id: {}", user.store(&db).unwrap());
     } else {
         panic!("Unable to connect to redis!");
     }
